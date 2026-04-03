@@ -1,7 +1,6 @@
 import os
 import zipfile
 import logging
-import tempfile
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -19,11 +18,16 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Store pending files per user: {user_id: [{"name": ..., "path": ...}]}
-user_files = {}
+TMP_DIR = "/tmp"
 
-# Track users who are being asked for a zip name
+user_files = {}        # {user_id: [{"name": ..., "path": ...}]}
 waiting_for_name = {}  # {user_id: True}
+
+
+def get_user_dir(user_id):
+    path = os.path.join(TMP_DIR, f"zipbot_{user_id}")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -31,10 +35,11 @@ waiting_for_name = {}  # {user_id: True}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to *ZIP Bot!*\n\n"
-        "📤 Send me any files and I'll compress them into a ZIP for you.\n\n"
+        "📤 Send me any files and I'll compress them into a ZIP.\n"
+        "After sending your files, I'll ask you what to name the ZIP.\n\n"
         "*Commands:*\n"
-        "/zip — Compress all sent files (bot will ask for a name)\n"
-        "/list — See files waiting to be zipped\n"
+        "/zip — Compress all sent files\n"
+        "/list — See queued files\n"
         "/clear — Remove all pending files\n"
         "/help — Show this message",
         parse_mode="Markdown"
@@ -48,15 +53,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     files = user_files.get(user_id, [])
-
     if not files:
-        await update.message.reply_text("📭 No files yet. Send me some files first!")
+        await update.message.reply_text("📭 No files queued. Send me some files first!")
         return
-
     file_list = "\n".join([f"  {i+1}. {f['name']}" for i, f in enumerate(files)])
     await update.message.reply_text(
-        f"📋 *Files ready to zip ({len(files)}):*\n\n{file_list}\n\n"
-        f"Send /zip to compress them all!",
+        f"📋 *Queued files ({len(files)}):*\n\n{file_list}\n\nSend /zip to compress!",
         parse_mode="Markdown"
     )
 
@@ -70,7 +72,7 @@ async def clear_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     user_files[user_id] = []
     waiting_for_name.pop(user_id, None)
-    await update.message.reply_text("🗑️ All pending files cleared. Start fresh!")
+    await update.message.reply_text("🗑️ All files cleared. Start fresh!")
 
 
 # ── File Receiver ─────────────────────────────────────────────────────────────
@@ -101,15 +103,15 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("⚠️ Unsupported file type.")
         return
 
-    # Save to temp folder
-    tmp_dir = tempfile.gettempdir()
-    save_path = os.path.join(tmp_dir, f"{user_id}_{file_name}")
+    # Save file to user's tmp folder
+    user_dir = get_user_dir(user_id)
+    save_path = os.path.join(user_dir, file_name)
 
     try:
         file_obj = await context.bot.get_file(tg_file.file_id)
         await file_obj.download_to_drive(save_path)
     except Exception as e:
-        await message.reply_text(f"❌ Failed to download file: {e}")
+        await message.reply_text(f"❌ Failed to download: {e}")
         return
 
     if user_id not in user_files:
@@ -118,64 +120,48 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_files[user_id].append({"name": file_name, "path": save_path})
     count = len(user_files[user_id])
 
-    await message.reply_text(
-        f"✅ *{file_name}* received!\n\n"
-        f"📦 {count} file(s) queued.\n"
-        f"Send more or use /zip to compress now.",
-        parse_mode="Markdown"
-    )
+    logger.info(f"User {user_id} queued {count} file(s)")
 
-
-# ── ZIP Name Handler ──────────────────────────────────────────────────────────
-
-async def create_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    files = user_files.get(user_id, [])
-
-    if not files:
-        await update.message.reply_text(
-            "📭 No files to zip!\n\nSend me some files first, then use /zip."
-        )
-        return
-
-    # Ask user for a zip name
+    # ✅ After every file, ask for zip name
     waiting_for_name[user_id] = True
-    await update.message.reply_text(
-        "📝 *What would you like to name the ZIP file?*\n\n"
-        "Just type the name and send it.\n"
-        "_Example:_ `my-music` or `project-files`\n\n"
-        "_(No need to add .zip — I'll do that automatically)_",
+    await message.reply_text(
+        f"✅ *{file_name}* received! ({count} file(s) queued)\n\n"
+        f"📝 *What do you want to name the ZIP file?*\n"
+        f"_(Type the name and send, or send more files first then type the name)_\n"
+        f"_No need to add .zip — I'll do that for you!_",
         parse_mode="Markdown"
     )
 
+
+# ── Text Handler — captures ZIP name ─────────────────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Check if we're waiting for a zip name from this user
     if waiting_for_name.get(user_id):
         zip_name = update.message.text.strip()
-
-        # Clean the name — remove .zip if they added it, strip bad chars
         zip_name = zip_name.replace(".zip", "").strip()
         zip_name = "".join(c for c in zip_name if c.isalnum() or c in "-_ ()").strip()
 
         if not zip_name:
             await update.message.reply_text(
-                "⚠️ That name isn't valid. Please use letters, numbers, spaces or dashes.\n"
-                "Try again:"
+                "⚠️ Invalid name. Use letters, numbers, spaces or dashes. Try again:"
             )
             return
 
-        # Clear the waiting flag
-        waiting_for_name.pop(user_id, None)
-
-        # Now zip the files
         files = user_files.get(user_id, [])
-        await update.message.reply_text(f"⏳ Zipping {len(files)} file(s) as *{zip_name}.zip*...", parse_mode="Markdown")
+        if not files:
+            waiting_for_name.pop(user_id, None)
+            await update.message.reply_text("📭 No files to zip. Send some files first!")
+            return
 
-        tmp_dir = tempfile.gettempdir()
-        zip_path = os.path.join(tmp_dir, f"{zip_name}_{user_id}.zip")
+        waiting_for_name.pop(user_id, None)
+        await update.message.reply_text(
+            f"⏳ Zipping *{len(files)}* file(s) as *{zip_name}.zip*...",
+            parse_mode="Markdown"
+        )
+
+        zip_path = os.path.join(TMP_DIR, f"{zip_name}_{user_id}.zip")
 
         try:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -209,21 +195,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.remove(f["path"])
                 except Exception:
                     pass
-            os.remove(zip_path)
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
             user_files[user_id] = []
 
         except Exception as e:
             logger.error(f"ZIP error: {e}")
             await update.message.reply_text(
-                f"❌ ZIP creation failed: {e}\n\nTry /clear and resend your files."
+                f"❌ ZIP failed: {e}\n\nTry /clear and resend your files."
             )
 
     else:
-        # Normal text — not waiting for a name
         await update.message.reply_text(
-            "📤 Send me files to zip, then use /zip when ready!\n"
+            "📤 Send me files to zip, then I'll ask for the ZIP name!\n"
             "Use /help to see all commands."
         )
+
+
+# ── /zip command — manual trigger ────────────────────────────────────────────
+
+async def create_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    files = user_files.get(user_id, [])
+
+    if not files:
+        await update.message.reply_text("📭 No files queued! Send some files first.")
+        return
+
+    waiting_for_name[user_id] = True
+    await update.message.reply_text(
+        f"📝 *What do you want to name the ZIP file?*\n\n"
+        f"You have *{len(files)}* file(s) ready.\n"
+        f"Just type the name and send it!\n"
+        f"_Example: my-music or project-files_",
+        parse_mode="Markdown"
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
