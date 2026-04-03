@@ -22,6 +22,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 # Store pending files per user: {user_id: [{"name": ..., "path": ...}]}
 user_files = {}
 
+# Track users who are being asked for a zip name
+waiting_for_name = {}  # {user_id: True}
+
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -30,7 +33,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to *ZIP Bot!*\n\n"
         "📤 Send me any files and I'll compress them into a ZIP for you.\n\n"
         "*Commands:*\n"
-        "/zip — Compress all sent files and receive the ZIP\n"
+        "/zip — Compress all sent files (bot will ask for a name)\n"
         "/list — See files waiting to be zipped\n"
         "/clear — Remove all pending files\n"
         "/help — Show this message",
@@ -66,6 +69,7 @@ async def clear_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     user_files[user_id] = []
+    waiting_for_name.pop(user_id, None)
     await update.message.reply_text("🗑️ All pending files cleared. Start fresh!")
 
 
@@ -122,7 +126,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── ZIP Creator ───────────────────────────────────────────────────────────────
+# ── ZIP Name Handler ──────────────────────────────────────────────────────────
 
 async def create_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -134,49 +138,91 @@ async def create_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(f"⏳ Zipping {len(files)} file(s)...")
+    # Ask user for a zip name
+    waiting_for_name[user_id] = True
+    await update.message.reply_text(
+        "📝 *What would you like to name the ZIP file?*\n\n"
+        "Just type the name and send it.\n"
+        "_Example:_ `my-music` or `project-files`\n\n"
+        "_(No need to add .zip — I'll do that automatically)_",
+        parse_mode="Markdown"
+    )
 
-    tmp_dir = tempfile.gettempdir()
-    zip_path = os.path.join(tmp_dir, f"compressed_{user_id}.zip")
 
-    try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in files:
-                if os.path.exists(f["path"]):
-                    zf.write(f["path"], arcname=f["name"])
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-        zip_size = os.path.getsize(zip_path)
-        zip_size_str = (
-            f"{zip_size / 1_048_576:.2f} MB" if zip_size >= 1_048_576
-            else f"{zip_size / 1024:.1f} KB"
-        )
+    # Check if we're waiting for a zip name from this user
+    if waiting_for_name.get(user_id):
+        zip_name = update.message.text.strip()
 
-        with open(zip_path, "rb") as zf:
-            await update.message.reply_document(
-                document=zf,
-                filename="compressed.zip",
-                caption=(
-                    f"✅ *Your ZIP is ready!*\n\n"
-                    f"📦 Files: *{len(files)}*\n"
-                    f"💾 Size: *{zip_size_str}*\n\n"
-                    f"_Queue cleared. Send new files anytime!_"
-                ),
-                parse_mode="Markdown"
+        # Clean the name — remove .zip if they added it, strip bad chars
+        zip_name = zip_name.replace(".zip", "").strip()
+        zip_name = "".join(c for c in zip_name if c.isalnum() or c in "-_ ()").strip()
+
+        if not zip_name:
+            await update.message.reply_text(
+                "⚠️ That name isn't valid. Please use letters, numbers, spaces or dashes.\n"
+                "Try again:"
+            )
+            return
+
+        # Clear the waiting flag
+        waiting_for_name.pop(user_id, None)
+
+        # Now zip the files
+        files = user_files.get(user_id, [])
+        await update.message.reply_text(f"⏳ Zipping {len(files)} file(s) as *{zip_name}.zip*...", parse_mode="Markdown")
+
+        tmp_dir = tempfile.gettempdir()
+        zip_path = os.path.join(tmp_dir, f"{zip_name}_{user_id}.zip")
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    if os.path.exists(f["path"]):
+                        zf.write(f["path"], arcname=f["name"])
+
+            zip_size = os.path.getsize(zip_path)
+            zip_size_str = (
+                f"{zip_size / 1_048_576:.2f} MB" if zip_size >= 1_048_576
+                else f"{zip_size / 1024:.1f} KB"
             )
 
-        # Cleanup
-        for f in files:
-            try:
-                os.remove(f["path"])
-            except Exception:
-                pass
-        os.remove(zip_path)
-        user_files[user_id] = []
+            with open(zip_path, "rb") as zf:
+                await update.message.reply_document(
+                    document=zf,
+                    filename=f"{zip_name}.zip",
+                    caption=(
+                        f"✅ *Your ZIP is ready!*\n\n"
+                        f"📁 Name: *{zip_name}.zip*\n"
+                        f"📦 Files: *{len(files)}*\n"
+                        f"💾 Size: *{zip_size_str}*\n\n"
+                        f"_Queue cleared. Send new files anytime!_"
+                    ),
+                    parse_mode="Markdown"
+                )
 
-    except Exception as e:
-        logger.error(f"ZIP error: {e}")
+            # Cleanup
+            for f in files:
+                try:
+                    os.remove(f["path"])
+                except Exception:
+                    pass
+            os.remove(zip_path)
+            user_files[user_id] = []
+
+        except Exception as e:
+            logger.error(f"ZIP error: {e}")
+            await update.message.reply_text(
+                f"❌ ZIP creation failed: {e}\n\nTry /clear and resend your files."
+            )
+
+    else:
+        # Normal text — not waiting for a name
         await update.message.reply_text(
-            f"❌ ZIP creation failed: {e}\n\nTry /clear and resend your files."
+            "📤 Send me files to zip, then use /zip when ready!\n"
+            "Use /help to see all commands."
         )
 
 
@@ -195,6 +241,7 @@ def main():
         filters.AUDIO | filters.VOICE,
         receive_file
     ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("✅ ZIP Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
