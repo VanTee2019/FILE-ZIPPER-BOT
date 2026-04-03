@@ -10,187 +10,134 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TMP_DIR = "/tmp"
 
-# Conversation states
-COLLECTING_FILES = 1
-WAITING_FOR_NAME = 2
+COLLECTING = 1
+NAMING = 2
 
-# Store files per user
 user_files = {}
 
 
-def get_user_dir(user_id):
-    path = os.path.join(TMP_DIR, f"zipbot_{user_id}")
-    os.makedirs(path, exist_ok=True)
-    return path
+def user_dir(uid):
+    p = os.path.join(TMP_DIR, f"zb_{uid}")
+    os.makedirs(p, exist_ok=True)
+    return p
 
-
-# ── /start ────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Welcome to *ZIP Bot!*\n\n"
+        "🆕 ZIP BOT v3 READY\n\n"
         "Send me files one by one.\n"
-        "When you are done, send /zip and I will ask you what to name the ZIP file before compressing.\n\n"
-        "*Commands:*\n"
-        "/zip — Done sending files, compress now\n"
-        "/list — See queued files\n"
-        "/clear — Clear all files\n"
-        "/help — Show this message",
-        parse_mode="Markdown"
+        "When done, send /zip and I will ask you to NAME the ZIP before compressing.\n\n"
+        "/zip - compress files\n"
+        "/list - see queued files\n"
+        "/clear - remove all files"
     )
-    return COLLECTING_FILES
+    return COLLECTING
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-    return COLLECTING_FILES
-
-
-# ── Collect files ─────────────────────────────────────────────────────────────
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message = update.message
+    uid = update.effective_user.id
+    msg = update.message
 
-    tg_file = None
-    file_name = None
+    f = None
+    name = None
 
-    if message.document:
-        tg_file = message.document
-        file_name = tg_file.file_name or f"file_{tg_file.file_id[:8]}"
-    elif message.photo:
-        tg_file = message.photo[-1]
-        file_name = f"photo_{tg_file.file_id[:8]}.jpg"
-    elif message.video:
-        tg_file = message.video
-        file_name = tg_file.file_name or f"video_{tg_file.file_id[:8]}.mp4"
-    elif message.audio:
-        tg_file = message.audio
-        file_name = tg_file.file_name or f"audio_{tg_file.file_id[:8]}.mp3"
-    elif message.voice:
-        tg_file = message.voice
-        file_name = f"voice_{tg_file.file_id[:8]}.ogg"
+    if msg.document:
+        f = msg.document
+        name = f.file_name or f"doc_{f.file_id[:6]}"
+    elif msg.audio:
+        f = msg.audio
+        name = f.file_name or f"audio_{f.file_id[:6]}.mp3"
+    elif msg.video:
+        f = msg.video
+        name = f.file_name or f"video_{f.file_id[:6]}.mp4"
+    elif msg.photo:
+        f = msg.photo[-1]
+        name = f"photo_{f.file_id[:6]}.jpg"
+    elif msg.voice:
+        f = msg.voice
+        name = f"voice_{f.file_id[:6]}.ogg"
     else:
-        await message.reply_text("⚠️ Unsupported file type. Send documents, photos, videos or audio.")
-        return COLLECTING_FILES
+        await msg.reply_text("⚠️ Send documents, audio, video or photos only.")
+        return COLLECTING
 
-    # Download and save
-    user_dir = get_user_dir(user_id)
-    save_path = os.path.join(user_dir, file_name)
+    path = os.path.join(user_dir(uid), name)
+    fo = await context.bot.get_file(f.file_id)
+    await fo.download_to_drive(path)
 
-    try:
-        file_obj = await context.bot.get_file(tg_file.file_id)
-        await file_obj.download_to_drive(save_path)
-    except Exception as e:
-        await message.reply_text(f"❌ Failed to download file: {e}")
-        return COLLECTING_FILES
+    if uid not in user_files:
+        user_files[uid] = []
+    user_files[uid].append({"name": name, "path": path})
+    n = len(user_files[uid])
 
-    if user_id not in user_files:
-        user_files[user_id] = []
-
-    user_files[user_id].append({"name": file_name, "path": save_path})
-    count = len(user_files[user_id])
-
-    await message.reply_text(
-        f"✅ *{file_name}* added!\n"
-        f"📦 {count} file(s) queued.\n\n"
-        f"Send more files or type /zip when done.",
-        parse_mode="Markdown"
+    await msg.reply_text(
+        f"✅ {name} saved! ({n} file(s) queued)\n\nSend more files or /zip to compress."
     )
-    return COLLECTING_FILES
+    return COLLECTING
 
 
-async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    files = user_files.get(user_id, [])
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    files = user_files.get(uid, [])
+    if not files:
+        await update.message.reply_text("📭 No files queued.")
+        return COLLECTING
+    lines = "\n".join(f"{i+1}. {f['name']}" for i, f in enumerate(files))
+    await update.message.reply_text(f"📋 Queued ({len(files)}):\n{lines}")
+    return COLLECTING
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    for f in user_files.get(uid, []):
+        try: os.remove(f["path"])
+        except: pass
+    user_files[uid] = []
+    await update.message.reply_text("🗑️ Cleared!")
+    return COLLECTING
+
+
+async def zip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    files = user_files.get(uid, [])
 
     if not files:
-        await update.message.reply_text("📭 No files queued yet. Send me some files!")
-        return COLLECTING_FILES
+        await update.message.reply_text("📭 No files yet! Send files first then /zip.")
+        return COLLECTING
 
-    file_list = "\n".join([f"  {i+1}. {f['name']}" for i, f in enumerate(files)])
+    lines = "\n".join(f"{i+1}. {f['name']}" for i, f in enumerate(files))
     await update.message.reply_text(
-        f"📋 *Queued files ({len(files)}):*\n\n{file_list}\n\n"
-        f"Type /zip when you are done.",
-        parse_mode="Markdown"
+        f"📋 Files queued ({len(files)}):\n{lines}\n\n"
+        f"✏️ TYPE THE NAME FOR YOUR ZIP FILE:\n"
+        f"(example: my-music)\n"
+        f"I will add .zip automatically"
     )
-    return COLLECTING_FILES
+    return NAMING
 
 
-async def clear_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    for f in user_files.get(user_id, []):
-        try:
-            os.remove(f["path"])
-        except Exception:
-            pass
-    user_files[user_id] = []
-    await update.message.reply_text("🗑️ All files cleared! Send new files anytime.")
-    return COLLECTING_FILES
+async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    raw = update.message.text.strip()
+    name = raw.replace(".zip", "").strip()
+    name = "".join(c for c in name if c.isalnum() or c in "-_ ").strip()
 
+    if not name:
+        await update.message.reply_text("⚠️ Invalid name. Try again (letters, numbers, dashes only):")
+        return NAMING
 
-# ── /zip — ask for name ───────────────────────────────────────────────────────
-
-async def ask_zip_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    files = user_files.get(user_id, [])
-
+    files = user_files.get(uid, [])
     if not files:
-        await update.message.reply_text(
-            "📭 You have not sent any files yet!\n\nSend me some files first then type /zip."
-        )
-        return COLLECTING_FILES
+        await update.message.reply_text("📭 No files! Send files first.")
+        return COLLECTING
 
-    file_list = "\n".join([f"  {i+1}. {f['name']}" for i, f in enumerate(files)])
-    await update.message.reply_text(
-        f"📋 *Files ready to compress ({len(files)}):*\n\n{file_list}\n\n"
-        f"📝 *What do you want to call the ZIP file?*\n"
-        f"Just type the name and send it.\n"
-        f"_Example: my-music or project-backup_\n"
-        f"_(No need to add .zip — I will do that!)_",
-        parse_mode="Markdown"
-    )
-    return WAITING_FOR_NAME
+    await update.message.reply_text(f"⏳ Creating {name}.zip with {len(files)} file(s)...")
 
-
-# ── Receive name and compress ─────────────────────────────────────────────────
-
-async def receive_name_and_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    # Clean the name
-    raw_name = update.message.text.strip()
-    zip_name = raw_name.replace(".zip", "").strip()
-    zip_name = "".join(c for c in zip_name if c.isalnum() or c in "-_ ()").strip()
-
-    if not zip_name:
-        await update.message.reply_text(
-            "⚠️ That name is not valid.\n"
-            "Please use letters, numbers, spaces or dashes.\n\n"
-            "Try again — what should the ZIP be called?"
-        )
-        return WAITING_FOR_NAME
-
-    files = user_files.get(user_id, [])
-    if not files:
-        await update.message.reply_text("📭 No files to zip! Send files first.")
-        return COLLECTING_FILES
-
-    await update.message.reply_text(
-        f"⏳ Compressing *{len(files)}* file(s) into *{zip_name}.zip* ...",
-        parse_mode="Markdown"
-    )
-
-    zip_path = os.path.join(TMP_DIR, f"{zip_name}_{user_id}.zip")
+    zip_path = os.path.join(TMP_DIR, f"{name}_{uid}.zip")
 
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -198,53 +145,33 @@ async def receive_name_and_zip(update: Update, context: ContextTypes.DEFAULT_TYP
                 if os.path.exists(f["path"]):
                     zf.write(f["path"], arcname=f["name"])
 
-        zip_size = os.path.getsize(zip_path)
-        zip_size_str = (
-            f"{zip_size / 1_048_576:.2f} MB" if zip_size >= 1_048_576
-            else f"{zip_size / 1024:.1f} KB"
-        )
+        size = os.path.getsize(zip_path)
+        size_str = f"{size/1048576:.2f} MB" if size >= 1048576 else f"{size/1024:.1f} KB"
 
         with open(zip_path, "rb") as zf:
             await update.message.reply_document(
                 document=zf,
-                filename=f"{zip_name}.zip",
-                caption=(
-                    f"✅ *Done! Here is your ZIP file.*\n\n"
-                    f"📁 Name: *{zip_name}.zip*\n"
-                    f"📦 Files inside: *{len(files)}*\n"
-                    f"💾 Size: *{zip_size_str}*\n\n"
-                    f"_Queue cleared. Send new files anytime!_"
-                ),
-                parse_mode="Markdown"
+                filename=f"{name}.zip",
+                caption=f"✅ Done!\n📁 {name}.zip\n📦 {len(files)} files\n💾 {size_str}"
             )
 
-        # Cleanup
         for f in files:
-            try:
-                os.remove(f["path"])
-            except Exception:
-                pass
-        try:
-            os.remove(zip_path)
-        except Exception:
-            pass
-        user_files[user_id] = []
+            try: os.remove(f["path"])
+            except: pass
+        try: os.remove(zip_path)
+        except: pass
+        user_files[uid] = []
 
     except Exception as e:
-        logger.error(f"ZIP error: {e}")
-        await update.message.reply_text(
-            f"❌ ZIP failed: {e}\n\nTry /clear and resend your files."
-        )
+        await update.message.reply_text(f"❌ Error: {e}")
 
-    return COLLECTING_FILES
+    return COLLECTING
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             MessageHandler(
@@ -254,32 +181,32 @@ def main():
             ),
         ],
         states={
-            COLLECTING_FILES: [
+            COLLECTING: [
                 MessageHandler(
                     filters.Document.ALL | filters.PHOTO | filters.VIDEO |
                     filters.AUDIO | filters.VOICE,
                     receive_file
                 ),
-                CommandHandler("zip", ask_zip_name),
-                CommandHandler("list", list_files),
-                CommandHandler("clear", clear_files),
-                CommandHandler("help", help_command),
+                CommandHandler("zip", zip_cmd),
+                CommandHandler("list", list_cmd),
+                CommandHandler("clear", clear_cmd),
             ],
-            WAITING_FOR_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name_and_zip),
-                CommandHandler("clear", clear_files),
+            NAMING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name),
+                CommandHandler("clear", clear_cmd),
             ],
         },
         fallbacks=[
             CommandHandler("start", start),
-            CommandHandler("clear", clear_files),
+            CommandHandler("clear", clear_cmd),
         ],
         allow_reentry=True,
+        name="zip_conversation",
+        persistent=False,
     )
 
-    app.add_handler(conv_handler)
-
-    logger.info("✅ ZIP Bot is running...")
+    app.add_handler(conv)
+    logger.info("✅ ZIP Bot v3 running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
