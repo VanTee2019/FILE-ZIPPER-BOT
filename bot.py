@@ -16,15 +16,21 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+
 TMP_DIR = "/tmp"
-MAX_TG_SIZE = 50 * 1024 * 1024  # 50MB Telegram limit
+MAX_TG_SIZE = 50 * 1024 * 1024    # 50MB send limit
+MAX_DOWNLOAD = 2 * 1024 * 1024 * 1024  # 2GB with local server
+
+# Local Bot API Server URL — removes the 20MB limit
+LOCAL_SERVER_URL = "http://localhost:8081"
 
 # Conversation states
 COLLECTING = 1
 NAMING = 2
-UNZIPPING = 3
 
-user_files = {}  # {uid: [{"name": ..., "path": ...}]}
+user_files = {}
 
 
 def user_dir(uid):
@@ -34,24 +40,33 @@ def user_dir(uid):
 
 
 def human_size(b):
+    if b >= 1_073_741_824:
+        return f"{b/1_073_741_824:.2f} GB"
     if b >= 1_048_576:
         return f"{b/1_048_576:.2f} MB"
     return f"{b/1024:.1f} KB"
+
+
+def get_file_size(f):
+    try:
+        return f.file_size or 0
+    except Exception:
+        return 0
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *ZIP Bot v4*\n\n"
-        "📦 *ZIP files:* Send files one by one, then /zip to compress\n"
-        "📂 *UNZIP files:* Send a .zip file and I will extract everything\n\n"
+        "👋 *ZIP Bot v5 — Large File Edition*\n\n"
+        "📦 *ZIP:* Send files → /zip → name it → get ZIP\n"
+        "📂 *UNZIP:* Send a .zip → bot extracts & sends files back\n\n"
+        "✅ Supports files up to *2GB* via Local Bot API\n\n"
         "*Commands:*\n"
-        "/zip — Compress queued files into a ZIP\n"
+        "/zip — Compress queued files\n"
         "/list — See queued files\n"
-        "/clear — Clear all queued files\n"
-        "/help — Show this message\n\n"
-        "_Large ZIPs over 50MB are auto-split into parts!_",
+        "/clear — Clear queue\n"
+        "/help — Show this message",
         parse_mode="Markdown"
     )
     return COLLECTING
@@ -93,7 +108,18 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Unsupported file type.")
         return COLLECTING
 
-    # Download the file
+    file_size = get_file_size(f)
+
+    # Check against 2GB limit
+    if file_size > MAX_DOWNLOAD:
+        await msg.reply_text(
+            f"❌ *{name}* is *{human_size(file_size)}* — exceeds 2GB limit.",
+            parse_mode="Markdown"
+        )
+        return COLLECTING
+
+    await msg.reply_text(f"⬇️ Downloading *{name}* ({human_size(file_size)}) ...", parse_mode="Markdown")
+
     path = os.path.join(user_dir(uid), name)
     try:
         fo = await context.bot.get_file(f.file_id)
@@ -102,18 +128,16 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ Download failed: {e}")
         return COLLECTING
 
-    # If it's a ZIP — offer to unzip it
+    # ZIP file — offer to unzip
     if is_zip:
         context.user_data["unzip_path"] = path
         context.user_data["unzip_name"] = name
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📂 Unzip it", callback_data="do_unzip"),
-                InlineKeyboardButton("📦 Add to queue", callback_data="add_to_queue"),
-            ]
-        ])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📂 Unzip it", callback_data="do_unzip"),
+            InlineKeyboardButton("📦 Add to queue", callback_data="add_to_queue"),
+        ]])
         await msg.reply_text(
-            f"📥 Received *{name}*\n\nWhat do you want to do with it?",
+            f"✅ *{name}* downloaded ({human_size(file_size)})\n\nWhat do you want to do?",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -126,7 +150,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = len(user_files[uid])
 
     await msg.reply_text(
-        f"✅ *{name}* added!\n"
+        f"✅ *{name}* added! ({human_size(file_size)})\n"
         f"📦 {n} file(s) queued.\n\n"
         f"Send more files or /zip to compress.",
         parse_mode="Markdown"
@@ -134,7 +158,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return COLLECTING
 
 
-# ── Unzip callback ────────────────────────────────────────────────────────────
+# ── Button callbacks ──────────────────────────────────────────────────────────
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -146,7 +170,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         zip_name = context.user_data.get("unzip_name", "archive.zip")
 
         if not zip_path or not os.path.exists(zip_path):
-            await query.edit_message_text("❌ ZIP file not found. Please send it again.")
+            await query.edit_message_text("❌ ZIP not found. Please send it again.")
             return COLLECTING
 
         await query.edit_message_text(f"📂 Extracting *{zip_name}* ...", parse_mode="Markdown")
@@ -160,8 +184,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 zf.extractall(extract_dir)
 
             await query.message.reply_text(
-                f"✅ Extracted *{len(members)}* file(s) from *{zip_name}*\n\n"
-                f"Sending them now...",
+                f"✅ Found *{len(members)}* item(s) — sending now...",
                 parse_mode="Markdown"
             )
 
@@ -169,13 +192,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             skipped = 0
             for member in members:
                 member_path = os.path.join(extract_dir, member)
-                # Skip directories
                 if os.path.isdir(member_path):
                     continue
                 file_size = os.path.getsize(member_path)
                 if file_size > MAX_TG_SIZE:
                     await query.message.reply_text(
-                        f"⚠️ *{member}* is {human_size(file_size)} — too large for Telegram (50MB limit), skipping.",
+                        f"⚠️ *{os.path.basename(member)}* is {human_size(file_size)} — too large to send, skipping.",
                         parse_mode="Markdown"
                     )
                     skipped += 1
@@ -189,37 +211,32 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     sent += 1
                 except Exception as e:
-                    await query.message.reply_text(f"⚠️ Could not send {member}: {e}")
+                    await query.message.reply_text(f"⚠️ Could not send {os.path.basename(member)}: {e}")
                     skipped += 1
 
-            summary = f"✅ *Done! Sent {sent} file(s)*"
+            summary = f"✅ *Extraction complete! Sent {sent} file(s)*"
             if skipped:
-                summary += f"\n⚠️ Skipped {skipped} file(s) — too large or unreadable"
+                summary += f"\n⚠️ Skipped {skipped} file(s) — too large"
             await query.message.reply_text(summary, parse_mode="Markdown")
 
-            # Cleanup
             shutil.rmtree(extract_dir, ignore_errors=True)
             try: os.remove(zip_path)
             except: pass
 
         except zipfile.BadZipFile:
-            await query.message.reply_text("❌ That file is not a valid ZIP archive.")
+            await query.message.reply_text("❌ Not a valid ZIP file.")
         except Exception as e:
             await query.message.reply_text(f"❌ Extraction failed: {e}")
 
     elif query.data == "add_to_queue":
         zip_path = context.user_data.get("unzip_path")
         zip_name = context.user_data.get("unzip_name", "archive.zip")
-
         if uid not in user_files:
             user_files[uid] = []
         user_files[uid].append({"name": zip_name, "path": zip_path})
         n = len(user_files[uid])
-
         await query.edit_message_text(
-            f"✅ *{zip_name}* added to queue!\n"
-            f"📦 {n} file(s) queued.\n\n"
-            f"Send more files or /zip to compress.",
+            f"✅ *{zip_name}* added to queue!\n📦 {n} file(s) queued.\n\nSend more or /zip to compress.",
             parse_mode="Markdown"
         )
 
@@ -254,7 +271,6 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def zip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     files = user_files.get(uid, [])
-
     if not files:
         await update.message.reply_text("📭 No files yet! Send files first then /zip.")
         return COLLECTING
@@ -263,14 +279,13 @@ async def zip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📋 *Files ready ({len(files)}):*\n\n{lines}\n\n"
         f"✏️ *What do you want to name the ZIP?*\n"
-        f"_Type the name and send it. No need to add .zip!_\n"
-        f"_Example: my-music or project-backup_",
+        f"_Type the name and send it — no need to add .zip!_",
         parse_mode="Markdown"
     )
     return NAMING
 
 
-# ── Receive name → compress & split if needed ─────────────────────────────────
+# ── Receive name → compress & auto-split ─────────────────────────────────────
 
 async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -279,14 +294,12 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = "".join(c for c in name if c.isalnum() or c in "-_ ").strip()
 
     if not name:
-        await update.message.reply_text(
-            "⚠️ Invalid name. Use letters, numbers, spaces or dashes.\nTry again:"
-        )
+        await update.message.reply_text("⚠️ Invalid name. Try again:")
         return NAMING
 
     files = user_files.get(uid, [])
     if not files:
-        await update.message.reply_text("📭 No files to zip! Send files first.")
+        await update.message.reply_text("📭 No files to zip!")
         return COLLECTING
 
     await update.message.reply_text(
@@ -304,36 +317,28 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         zip_size = os.path.getsize(zip_path)
 
-        # ── Split if over 50MB ────────────────────────────────────────────────
         if zip_size > MAX_TG_SIZE:
+            part_size = MAX_TG_SIZE - (1 * 1024 * 1024)
+            num_parts = math.ceil(zip_size / part_size)
             await update.message.reply_text(
-                f"📦 ZIP is *{human_size(zip_size)}* — too large for Telegram!\n"
-                f"✂️ Splitting into parts...",
+                f"📦 ZIP is *{human_size(zip_size)}* — splitting into *{num_parts} parts* ...",
                 parse_mode="Markdown"
             )
-
-            part_size = MAX_TG_SIZE - (1 * 1024 * 1024)  # 49MB per part
-            num_parts = math.ceil(zip_size / part_size)
             parts_sent = 0
-
             with open(zip_path, "rb") as zf:
                 for i in range(num_parts):
                     part_data = zf.read(part_size)
                     if not part_data:
                         break
-                    part_filename = f"{name}.zip.part{i+1:03d}"
+                    part_filename = f"{name}.part{i+1:03d}.zip"
                     part_path = os.path.join(TMP_DIR, f"{uid}_{part_filename}")
                     with open(part_path, "wb") as pf:
                         pf.write(part_data)
-
                     with open(part_path, "rb") as pf:
                         await update.message.reply_document(
                             document=pf,
                             filename=part_filename,
-                            caption=(
-                                f"📦 *{name}.zip* — Part {i+1} of {num_parts}\n"
-                                f"💾 {human_size(len(part_data))}"
-                            ),
+                            caption=f"📦 *{name}.zip* — Part {i+1}/{num_parts} ({human_size(len(part_data))})",
                             parse_mode="Markdown"
                         )
                     parts_sent += 1
@@ -341,20 +346,16 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except: pass
 
             await update.message.reply_text(
-                f"✅ *Done! Sent {parts_sent} parts.*\n\n"
-                f"_To reassemble: rename parts to_ `{name}.zip.001`, `{name}.zip.002` _etc._\n"
-                f"_Then use 7-Zip or WinRAR to join them._",
+                f"✅ *Done! Sent {parts_sent} parts.*\n_Use 7-Zip or WinRAR to join them._",
                 parse_mode="Markdown"
             )
-
         else:
-            # ── Send as single ZIP ────────────────────────────────────────────
             with open(zip_path, "rb") as zf:
                 await update.message.reply_document(
                     document=zf,
                     filename=f"{name}.zip",
                     caption=(
-                        f"✅ *Done! Here is your ZIP.*\n\n"
+                        f"✅ *Your ZIP is ready!*\n\n"
                         f"📁 *{name}.zip*\n"
                         f"📦 Files: *{len(files)}*\n"
                         f"💾 Size: *{human_size(zip_size)}*"
@@ -362,7 +363,6 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
 
-        # Cleanup
         for f in files:
             try: os.remove(f["path"])
             except: pass
@@ -380,7 +380,15 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Connect to Local Bot API Server to bypass 20MB limit
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .local_mode(True)
+        .base_url(f"{LOCAL_SERVER_URL}/bot")
+        .base_file_url(f"{LOCAL_SERVER_URL}/file/bot")
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[
@@ -419,7 +427,7 @@ def main():
     )
 
     app.add_handler(conv)
-    logger.info("✅ ZIP Bot v4 running!")
+    logger.info("✅ ZIP Bot v5 running with Local API Server!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
