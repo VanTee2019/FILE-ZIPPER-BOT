@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["telegram-bot-api", "python311"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "bash start_local_server.sh"
